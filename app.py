@@ -1,0 +1,957 @@
+import streamlit as st
+import gspread
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from google.oauth2.service_account import Credentials
+from datetime import datetime, timedelta, date
+
+# ============================================================
+# 설정
+# ============================================================
+st.set_page_config(
+    page_title="리워드 플랫폼 대시보드",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+/* ── 전역 ── */
+html, body, [class*="css"] {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+.main .block-container { padding-top: 1.5rem; max-width: 1400px; }
+
+/* ── 사이드바 ── */
+section[data-testid="stSidebar"] {
+    background: #0f1117;
+    border-right: 1px solid rgba(255,255,255,0.06);
+}
+section[data-testid="stSidebar"] .stMarkdown h2,
+section[data-testid="stSidebar"] .stMarkdown h3 {
+    color: #e2e8f0 !important;
+    font-weight: 600;
+}
+
+/* ── 메트릭 카드 ── */
+div[data-testid="stMetric"] {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 14px;
+    padding: 18px 22px;
+    backdrop-filter: blur(10px);
+    transition: transform 0.15s, border-color 0.15s;
+}
+div[data-testid="stMetric"]:hover {
+    transform: translateY(-2px);
+    border-color: rgba(99,102,241,0.4);
+}
+div[data-testid="stMetric"] label {
+    color: #94a3b8 !important;
+    font-size: 0.78rem !important;
+    font-weight: 500 !important;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
+    color: #f1f5f9 !important;
+    font-size: 1.55rem !important;
+    font-weight: 700 !important;
+}
+div[data-testid="stMetric"] div[data-testid="stMetricDelta"] svg { display: none; }
+div[data-testid="stMetric"] div[data-testid="stMetricDelta"] {
+    font-size: 0.75rem !important;
+    font-weight: 500 !important;
+}
+
+/* ── 섹션 헤더 ── */
+.main h2 {
+    font-size: 1.3rem !important;
+    font-weight: 700 !important;
+    color: #e2e8f0 !important;
+    margin-top: 0.5rem !important;
+    padding-bottom: 0.3rem;
+    border-bottom: 2px solid rgba(99,102,241,0.3);
+    display: inline-block;
+}
+.main h4 {
+    font-size: 0.95rem !important;
+    font-weight: 600 !important;
+    color: #cbd5e1 !important;
+}
+
+/* ── 탭 ── */
+button[data-baseweb="tab"] {
+    font-weight: 600 !important;
+    font-size: 0.88rem !important;
+    padding: 10px 20px !important;
+    border-radius: 10px 10px 0 0 !important;
+}
+div[data-baseweb="tab-highlight"] {
+    background-color: #6366f1 !important;
+}
+
+/* ── 데이터프레임 ── */
+div[data-testid="stDataFrame"] {
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+/* ── 구분선 ── */
+hr { border-color: rgba(255,255,255,0.06) !important; margin: 1.2rem 0 !important; }
+
+/* ── date_input 좁게 ── */
+div[data-testid="stDateInput"] { max-width: 170px; }
+
+/* ── 버튼 ── */
+.stDownloadButton button, .stButton button {
+    border-radius: 10px !important;
+    font-weight: 600 !important;
+    border: 1px solid rgba(255,255,255,0.1) !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+SHEET_NAMES = {
+    "포인트클릭": {"db": "포인트클릭_DB"},
+    "캐시플레이": {"db": "캐시플레이_DB"}
+}
+
+# ============================================================
+# 숫자 포맷 (그래프 축 / hover 용)
+# ============================================================
+def fmt_axis_won(val):
+    """축 tick용: 1200만, 3.2억 등"""
+    av = abs(val)
+    sign = "-" if val < 0 else ""
+    if av >= 1e8:
+        return f"{sign}{val/1e8:.1f}억"
+    if av >= 1e4:
+        return f"{sign}{val/1e4:,.0f}만"
+    return f"{sign}{val:,.0f}"
+
+def fmt_hover_won(val):
+    """hover용: ₩12,345,678"""
+    return f"₩{val:,.0f}"
+
+# ============================================================
+# 공통 차트 레이아웃
+# ============================================================
+CHART_LAYOUT = dict(
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(family="Inter, sans-serif", color="#94a3b8", size=12),
+    margin=dict(t=15, b=50, l=60, r=20),
+    legend=dict(
+        orientation="h", yanchor="bottom", y=1.04, xanchor="right", x=1,
+        font=dict(size=11), bgcolor="rgba(0,0,0,0)"
+    ),
+    xaxis=dict(
+        gridcolor="rgba(255,255,255,0.04)", showgrid=False,
+        tickfont=dict(size=10.5), linecolor="rgba(255,255,255,0.08)"
+    ),
+    yaxis=dict(
+        gridcolor="rgba(255,255,255,0.06)", gridwidth=1,
+        tickfont=dict(size=11), linecolor="rgba(255,255,255,0.08)",
+        zerolinecolor="rgba(255,255,255,0.08)"
+    ),
+    hoverlabel=dict(bgcolor="#1e1e2e", font_size=12, font_family="Inter"),
+    hovermode="x unified",
+)
+
+def apply_layout(fig, extra=None, yformat_won=True, y2format_pct=False):
+    layout = {**CHART_LAYOUT}
+    if extra:
+        layout.update(extra)
+    fig.update_layout(**layout)
+    if yformat_won:
+        fig.update_yaxes(tickformat=",.0f", selector=dict(side="left"))
+        # 한글 tick
+        fig.update_yaxes(
+            tickprefix="", ticksuffix="",
+            selector=dict(side="left")
+        )
+    if y2format_pct:
+        fig.update_yaxes(ticksuffix="%", selector=dict(side="right"))
+    return fig
+
+def set_y_korean_ticks(fig, values, axis='y'):
+    """y축 값을 한글 단위 tick으로 교체"""
+    import numpy as np
+    if len(values) == 0:
+        return
+    vmax = max(abs(v) for v in values if v == v)  # nan 제외
+    if vmax == 0:
+        return
+    # 적절한 tick 간격 계산
+    nice = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
+    step_raw = vmax / 5
+    if vmax >= 1e8:
+        unit = 1e8
+    elif vmax >= 1e4:
+        unit = 1e4
+    else:
+        unit = 1
+    step_units = step_raw / unit
+    chosen = 1
+    for n in nice:
+        if n >= step_units:
+            chosen = n
+            break
+    step = chosen * unit
+    tick_vals = []
+    tick_texts = []
+    v = 0
+    mn = min(values)
+    while v <= vmax * 1.15:
+        tick_vals.append(v)
+        tick_texts.append(fmt_axis_won(v))
+        if mn < 0:
+            tick_vals.append(-v)
+            tick_texts.append(fmt_axis_won(-v))
+        v += step
+        if v > 1e12:
+            break
+    if axis == 'y':
+        fig.update_yaxes(tickvals=tick_vals, ticktext=tick_texts, selector=dict(overlaying=None))
+    elif axis == 'y2':
+        fig.update_yaxes(tickvals=tick_vals, ticktext=tick_texts, selector=dict(overlaying='y'))
+
+
+# ============================================================
+# 컬러 팔레트
+# ============================================================
+COLORS = {
+    'indigo': '#6366f1', 'violet': '#8b5cf6', 'blue': '#3b82f6',
+    'cyan': '#06b6d4', 'emerald': '#10b981', 'amber': '#f59e0b',
+    'rose': '#f43f5e', 'orange': '#f97316', 'slate': '#64748b',
+    'teal': '#14b8a6', 'pink': '#ec4899', 'lime': '#84cc16',
+    # 의미별
+    'revenue': '#6366f1', 'cost': '#f43f5e', 'margin': '#10b981',
+    'margin_rate': '#f59e0b',
+    'game': '#3b82f6', 'gathering': '#8b5cf6', 'iaa': '#10b981', 'offerwall': '#f97316',
+    'pc_highlight': '#f43f5e',
+}
+PUB_COLORS = ['#6366f1', '#f97316', '#10b981', '#8b5cf6', '#f43f5e', '#14b8a6', '#f59e0b', '#64748b']
+
+# ============================================================
+# 인증 (Streamlit 내장 Google OIDC)
+# ============================================================
+ALLOWED_DOMAIN = "cauly.net"  # 회사 도메인
+
+if not st.user.is_logged_in:
+    c1, c2, c3 = st.columns([1, 1.5, 1])
+    with c2:
+        st.markdown("")
+        st.markdown("### 📊 리워드 플랫폼 대시보드")
+        st.caption(f"@{ALLOWED_DOMAIN} 계정으로 로그인해 주세요")
+        st.markdown("")
+        if st.button("🔑 Google 계정으로 로그인", use_container_width=True):
+            st.login()
+    st.stop()
+
+# 도메인 검증
+user_email = st.user.get("email", "")
+if not user_email.endswith(f"@{ALLOWED_DOMAIN}"):
+    st.error(f"⛔ @{ALLOWED_DOMAIN} 계정만 접근할 수 있습니다. ({user_email})")
+    if st.button("다른 계정으로 로그인"):
+        st.logout()
+    st.stop()
+
+# ============================================================
+# 데이터 로딩
+# ============================================================
+@st.cache_data(ttl=600)
+def load_sheet_data(sheet_name: str) -> pd.DataFrame:
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    )
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(st.secrets["spreadsheet_id"])
+    ws = sh.worksheet(sheet_name)
+    data = ws.get_all_records()
+    return pd.DataFrame(data) if data else pd.DataFrame()
+
+
+def load_pointclick(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    col_map = {
+        '일자': 'date', '광고구분': 'ad_category', '매체타입': 'media_type',
+        '퍼블리셔타입': 'publisher_type', '광고명': 'ad_name', '매체명': 'media_name',
+        'CD': 'cd', '광고주명': 'advertiser', 'OS': 'os', '광고타입': 'ad_type',
+        '광고단가': 'unit_price', '클릭수': 'clicks', '전환수': 'conversions',
+        '광고비': 'ad_revenue', '매체수익금': 'media_cost', '매체정산비율': 'media_rate',
+        '마진금액': 'margin', '마진율': 'margin_rate', 'CVR': 'cvr',
+        '주차': 'week', '월별': 'month'
+    }
+    df = df.rename(columns=col_map)
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    for c in ['unit_price','clicks','conversions','ad_revenue','media_cost','media_rate','margin','margin_rate','cvr']:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+    return df
+
+
+def load_cashplay(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    col_map = {
+        '날짜': 'date',
+        '리워드(원)_유상': 'reward_paid', '리워드(원)_무상': 'reward_free', '리워드(원)_합계': 'reward_total',
+        '게임(원)_직거래': 'game_direct', '게임(원)_DSP': 'game_dsp', '게임(원)_RS': 'game_rs',
+        '게임(원)_인수': 'game_acquisition', '게임(원)_합계': 'game_total',
+        '게더링(원)_포인트클릭': 'gathering_pointclick',
+        'IAA(원)_레벨플레이': 'iaa_levelplay', 'IAA(원)_애드웨일': 'iaa_adwhale',
+        'IAA(원)_허블': 'iaa_hubble', 'IAA(원)_합계': 'iaa_total',
+        '오퍼월(원)_애드팝콘': 'offerwall_adpopcorn', '오퍼월(원)_포인트클릭': 'offerwall_pointclick',
+        '오퍼월(원)_아이브': 'offerwall_ive', '오퍼월(원)_애드포러스': 'offerwall_adforus',
+        '오퍼월(원)_애디슨': 'offerwall_addison', '오퍼월(원)_애드조': 'offerwall_adjo',
+        '오퍼월(원)_합계': 'offerwall_total'
+    }
+    df = df.rename(columns=col_map)
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    for c in [x for x in df.columns if x != 'date']:
+        df[c] = pd.to_numeric(df[c].replace('-', 0), errors='coerce').fillna(0)
+    df['revenue_total'] = df['game_total'] + df['gathering_pointclick'] + df['iaa_total'] + df['offerwall_total']
+    df['cost_total'] = df['reward_total']
+    df['margin'] = df['revenue_total'] - df['cost_total']
+    df['margin_rate'] = (df['margin'] / df['revenue_total'] * 100).round(1).replace([float('inf'), float('-inf')], 0)
+    df['pointclick_revenue'] = df['gathering_pointclick'] + df['offerwall_pointclick']
+    df['pointclick_ratio'] = (df['pointclick_revenue'] / df['revenue_total'] * 100).round(1).replace([float('inf'), float('-inf')], 0)
+    return df
+
+
+# ============================================================
+# 유틸리티
+# ============================================================
+def format_won(n):
+    if abs(n) >= 1e8:
+        return f"₩{n/1e8:.1f}억"
+    if abs(n) >= 1e4:
+        return f"₩{n/1e4:,.0f}만"
+    return f"₩{n:,.0f}"
+
+def format_number(n):
+    return f"{n:,.0f}"
+
+def format_pct(n):
+    return f"{n:,.1f}%"
+
+def calc_delta_pct(series):
+    if len(series) < 2:
+        return None
+    curr, prev = series.iloc[-1], series.iloc[-2]
+    if prev == 0:
+        return None
+    return round((curr - prev) / prev * 100, 1)
+
+def get_kpi_default_dates(data_min, data_max):
+    yesterday = date.today() - timedelta(days=1)
+    first = yesterday.replace(day=1)
+    return max(first, data_min), min(yesterday, data_max)
+
+def get_trend_default_dates(data_min, data_max):
+    yesterday = date.today() - timedelta(days=1)
+    ago = yesterday - timedelta(days=180)
+    return max(ago, data_min), min(yesterday, data_max)
+
+def make_weekly(df, date_col='date', group_col=None):
+    if df.empty:
+        return df
+    t = df.copy()
+    t['week_start'] = t[date_col].dt.to_period('W-SUN').apply(lambda x: x.start_time)
+    nums = [c for c in t.columns if pd.api.types.is_numeric_dtype(t[c]) and c != date_col]
+    if group_col:
+        r = t.groupby(['week_start', group_col])[nums].sum().reset_index()
+    else:
+        r = t.groupby('week_start')[nums].sum().reset_index()
+    return r.rename(columns={'week_start': 'week'})
+
+def week_label(d):
+    e = d + timedelta(days=6)
+    return f"{d.month}/{d.day}~{e.month}/{e.day}"
+
+
+# ============================================================
+# 포인트클릭 대시보드
+# ============================================================
+def render_pointclick_dashboard(df: pd.DataFrame):
+    if df.empty:
+        st.warning("포인트클릭 데이터가 없습니다.")
+        return
+
+    dmin, dmax = df['date'].min().date(), df['date'].max().date()
+
+    with st.sidebar:
+        st.markdown("### 🔍 포인트클릭 필터")
+        pub_types = ['전체'] + sorted(df['publisher_type'].unique().tolist())
+        sel_pub = st.selectbox("퍼블리셔 타입", pub_types, key="pc_pub")
+        ad_types = ['전체'] + sorted(df['ad_type'].unique().tolist())
+        sel_ad = st.selectbox("광고 타입", ad_types, key="pc_adtype")
+        os_types = ['전체'] + sorted(df['os'].unique().tolist())
+        sel_os = st.selectbox("OS", os_types, key="pc_os")
+
+    f = df.copy()
+    if sel_pub != '전체': f = f[f['publisher_type'] == sel_pub]
+    if sel_ad != '전체': f = f[f['ad_type'] == sel_ad]
+    if sel_os != '전체': f = f[f['os'] == sel_os]
+
+    # ── 핵심 지표 ──
+    st.markdown("## 📈 핵심 지표")
+    ks, ke = get_kpi_default_dates(dmin, dmax)
+    c1, c2, _ = st.columns([1, 1, 4])
+    with c1: kf = st.date_input("시작일", value=ks, min_value=dmin, max_value=dmax, key="pc_kf")
+    with c2: kt = st.date_input("종료일", value=ke, min_value=dmin, max_value=dmax, key="pc_kt")
+
+    kdf = f[(f['date'].dt.date >= kf) & (f['date'].dt.date <= kt)]
+
+    if kdf.empty:
+        st.warning("선택한 기간에 데이터가 없습니다.")
+    else:
+        daily = kdf.groupby('date').agg(
+            ad_revenue=('ad_revenue','sum'), media_cost=('media_cost','sum'),
+            margin=('margin','sum'), clicks=('clicks','sum'), conversions=('conversions','sum')
+        ).reset_index().sort_values('date')
+
+        tr = kdf['ad_revenue'].sum()
+        tm = kdf['margin'].sum()
+        tc = kdf['clicks'].sum()
+        tv = kdf['conversions'].sum()
+        amr = (tm / tr * 100) if tr else 0
+        acvr = (tv / tc * 100) if tc else 0
+
+        m1,m2,m3,m4,m5 = st.columns(5)
+        m1.metric("광고비(매출)", format_won(tr), delta=f"{calc_delta_pct(daily['ad_revenue']) or 0:+.1f}% 전일비")
+        m2.metric("마진", format_won(tm), delta=f"{calc_delta_pct(daily['margin']) or 0:+.1f}% 전일비")
+        m3.metric("마진율", format_pct(amr))
+        m4.metric("전환수", format_number(tv), delta=f"{calc_delta_pct(daily['conversions']) or 0:+.1f}% 전일비")
+        m5.metric("평균 CVR", format_pct(acvr))
+
+    st.markdown("---")
+
+    # ── 매출/마진 추이 ──
+    st.markdown("## 💰 매출 · 마진 추이 (주단위)")
+    ts, te = get_trend_default_dates(dmin, dmax)
+    t1, t2, _ = st.columns([1, 1, 4])
+    with t1: tf = st.date_input("시작일", value=ts, min_value=dmin, max_value=dmax, key="pc_tf")
+    with t2: tt = st.date_input("종료일", value=te, min_value=dmin, max_value=dmax, key="pc_tt")
+
+    tdf = f[(f['date'].dt.date >= tf) & (f['date'].dt.date <= tt)]
+
+    if tdf.empty:
+        st.warning("선택한 기간에 데이터가 없습니다.")
+    else:
+        wp = make_weekly(tdf, group_col='publisher_type')
+        wp['wl'] = wp['week'].apply(week_label)
+        wt = make_weekly(tdf)
+        wt['margin_rate'] = (wt['margin'] / wt['ad_revenue'] * 100).round(1).replace([float('inf'),float('-inf')],0).fillna(0)
+        wt['wl'] = wt['week'].apply(week_label)
+        pubs = sorted(wp['publisher_type'].unique().tolist())
+
+        cl, cr = st.columns(2)
+
+        with cl:
+            st.markdown("#### 광고비(매출) — 퍼블리셔별")
+            fig = go.Figure()
+            for i, p in enumerate(pubs):
+                s = wp[wp['publisher_type']==p].sort_values('week')
+                fig.add_trace(go.Bar(
+                    x=s['wl'], y=s['ad_revenue'], name=p,
+                    marker_color=PUB_COLORS[i%len(PUB_COLORS)],
+                    hovertemplate=f"<b>{p}</b><br>%{{x}}<br>%{{y:,.0f}}원<extra></extra>"
+                ))
+            apply_layout(fig, dict(barmode='stack', height=400, xaxis_tickangle=-45, yaxis_title=""))
+            set_y_korean_ticks(fig, wp['ad_revenue'].tolist())
+            st.plotly_chart(fig, use_container_width=True)
+
+        with cr:
+            st.markdown("#### 마진 · 마진율")
+            fig2 = go.Figure()
+            for i, p in enumerate(pubs):
+                s = wp[wp['publisher_type']==p].sort_values('week')
+                fig2.add_trace(go.Bar(
+                    x=s['wl'], y=s['margin'], name=p,
+                    marker_color=PUB_COLORS[i%len(PUB_COLORS)], showlegend=False,
+                    hovertemplate=f"<b>{p}</b><br>%{{x}}<br>%{{y:,.0f}}원<extra></extra>"
+                ))
+            fig2.add_trace(go.Scatter(
+                x=wt['wl'], y=wt['margin_rate'], name='마진율',
+                mode='lines+markers+text',
+                text=[f"{v:.1f}%" for v in wt['margin_rate']],
+                textposition='top center', textfont=dict(size=10, color=COLORS['margin_rate']),
+                line=dict(color=COLORS['margin_rate'], width=2.5),
+                marker=dict(size=7, color=COLORS['margin_rate']),
+                yaxis='y2',
+                hovertemplate="마진율: %{y:.1f}%<extra></extra>"
+            ))
+            apply_layout(fig2, dict(
+                barmode='stack', height=400, xaxis_tickangle=-45, yaxis_title="",
+                yaxis2=dict(
+                    title="", overlaying='y', side='right',
+                    range=[0, max(wt['margin_rate'].max()*1.5, 10)],
+                    ticksuffix="%", gridcolor="rgba(0,0,0,0)",
+                    tickfont=dict(size=11, color=COLORS['margin_rate'])
+                )
+            ))
+            set_y_korean_ticks(fig2, wp['margin'].tolist())
+            st.plotly_chart(fig2, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── 상세 분석 ──
+    st.markdown("## 🔎 상세 분석")
+    st.caption(f"📅 {kf} ~ {kt}")
+
+    if kdf.empty:
+        st.warning("데이터가 없습니다.")
+        return
+
+    tab_conv, tab_adv, tab_media, tab_raw = st.tabs([
+        "🎯 광고타입별 전환", "📊 광고주별", "📡 매체별", "📋 Raw"
+    ])
+
+    with tab_conv:
+        at = kdf.groupby('ad_type').agg(
+            clicks=('clicks','sum'), conversions=('conversions','sum'),
+            ad_revenue=('ad_revenue','sum'), margin=('margin','sum')
+        ).reset_index()
+        at['cvr'] = (at['conversions']/at['clicks']*100).round(2).replace([float('inf'),float('-inf')],0).fillna(0)
+        at['margin_rate'] = (at['margin']/at['ad_revenue']*100).round(1).replace([float('inf'),float('-inf')],0).fillna(0)
+        at = at.sort_values('ad_revenue', ascending=False)
+
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            fig_a = go.Figure()
+            fig_a.add_trace(go.Bar(x=at['ad_type'], y=at['clicks'], name='클릭수',
+                marker_color=COLORS['blue'], opacity=0.5,
+                hovertemplate="클릭: %{y:,.0f}<extra></extra>"))
+            fig_a.add_trace(go.Bar(x=at['ad_type'], y=at['conversions'], name='전환수',
+                marker_color=COLORS['emerald'], opacity=0.85,
+                hovertemplate="전환: %{y:,.0f}<extra></extra>"))
+            fig_a.add_trace(go.Scatter(
+                x=at['ad_type'], y=at['cvr'], name='CVR', mode='lines+markers+text',
+                text=[f"{v:.1f}%" for v in at['cvr']], textposition='top center',
+                textfont=dict(size=10, color=COLORS['rose']),
+                line=dict(color=COLORS['rose'], width=2.5), marker=dict(size=9),
+                yaxis='y2', hovertemplate="CVR: %{y:.2f}%<extra></extra>"
+            ))
+            apply_layout(fig_a, dict(
+                barmode='group', height=400, yaxis_title="",
+                yaxis2=dict(title="", overlaying='y', side='right',
+                    range=[0, max(at['cvr'].max()*1.5, 10)], ticksuffix="%",
+                    gridcolor="rgba(0,0,0,0)", tickfont=dict(color=COLORS['rose']))
+            ))
+            st.plotly_chart(fig_a, use_container_width=True)
+        with cc2:
+            d = at.copy()
+            d['clicks'] = d['clicks'].apply(lambda x: f"{x:,.0f}")
+            d['conversions'] = d['conversions'].apply(lambda x: f"{x:,.0f}")
+            d['ad_revenue'] = d['ad_revenue'].apply(lambda x: f"{x:,.0f}")
+            d['margin'] = d['margin'].apply(lambda x: f"{x:,.0f}")
+            d['cvr'] = d['cvr'].apply(lambda x: f"{x:.2f}%")
+            d['margin_rate'] = d['margin_rate'].apply(lambda x: f"{x:.1f}%")
+            st.dataframe(d.rename(columns={
+                'ad_type':'광고타입','clicks':'클릭수','conversions':'전환수',
+                'ad_revenue':'광고비(매출)','margin':'마진','cvr':'CVR','margin_rate':'마진율'
+            }), use_container_width=True, hide_index=True, height=400)
+
+        st.markdown("##### 일별 광고타입별 전환수")
+        dat = kdf.groupby(['date','ad_type']).agg(conversions=('conversions','sum')).reset_index()
+        fig_d = go.Figure()
+        for a in sorted(kdf['ad_type'].unique()):
+            s = dat[dat['ad_type']==a].sort_values('date')
+            fig_d.add_trace(go.Scatter(x=s['date'], y=s['conversions'], name=a, mode='lines+markers',
+                hovertemplate=f"<b>{a}</b><br>%{{x|%m/%d}}: %{{y:,.0f}}건<extra></extra>"))
+        apply_layout(fig_d, dict(height=320, yaxis_title=""))
+        st.plotly_chart(fig_d, use_container_width=True)
+
+    with tab_adv:
+        adv = kdf.groupby('advertiser').agg(
+            ad_revenue=('ad_revenue','sum'), margin=('margin','sum'),
+            conversions=('conversions','sum'), clicks=('clicks','sum'), ad_count=('ad_name','nunique')
+        ).reset_index()
+        adv['margin_rate'] = (adv['margin']/adv['ad_revenue']*100).round(1)
+        adv['cvr'] = (adv['conversions']/adv['clicks']*100).round(1)
+        adv = adv.replace([float('inf'),float('-inf')],0).fillna(0).sort_values('ad_revenue', ascending=False)
+
+        a1, a2 = st.columns(2)
+        with a1:
+            fig_av = px.bar(adv.head(15), x='ad_revenue', y='advertiser', orientation='h',
+                color='margin_rate', color_continuous_scale='RdYlGn',
+                labels={'ad_revenue':'광고비(매출)','advertiser':'광고주','margin_rate':'마진율(%)'})
+            fig_av.update_traces(hovertemplate="<b>%{y}</b><br>매출: %{x:,.0f}원<br>마진율: %{marker.color:.1f}%<extra></extra>")
+            apply_layout(fig_av, dict(height=450, yaxis=dict(autorange="reversed")))
+            st.plotly_chart(fig_av, use_container_width=True)
+        with a2:
+            da = adv.copy()
+            for c in ['ad_revenue','margin','conversions','clicks','ad_count']:
+                da[c] = da[c].apply(lambda x: f"{x:,.0f}")
+            da['margin_rate'] = da['margin_rate'].apply(lambda x: f"{x:.1f}%")
+            da['cvr'] = da['cvr'].apply(lambda x: f"{x:.1f}%")
+            st.dataframe(da.rename(columns={
+                'advertiser':'광고주','ad_revenue':'광고비(매출)','margin':'마진',
+                'margin_rate':'마진율','conversions':'전환수','clicks':'클릭수','cvr':'CVR','ad_count':'광고수'
+            }), use_container_width=True, hide_index=True, height=450)
+
+    with tab_media:
+        med = kdf.groupby('media_name').agg(
+            ad_revenue=('ad_revenue','sum'), margin=('margin','sum'),
+            conversions=('conversions','sum'), clicks=('clicks','sum')
+        ).reset_index()
+        med['margin_rate'] = (med['margin']/med['ad_revenue']*100).round(1)
+        med['cvr'] = (med['conversions']/med['clicks']*100).round(1)
+        med = med.replace([float('inf'),float('-inf')],0).fillna(0).sort_values('ad_revenue', ascending=False)
+
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            fig_m = px.treemap(med.head(20), path=['media_name'], values='ad_revenue',
+                color='margin_rate', color_continuous_scale='RdYlGn')
+            fig_m.update_traces(hovertemplate="<b>%{label}</b><br>매출: %{value:,.0f}원<br>마진율: %{color:.1f}%<extra></extra>")
+            fig_m.update_layout(height=450, margin=dict(t=10,b=10),
+                paper_bgcolor="rgba(0,0,0,0)", font=dict(family="Inter", color="#94a3b8"))
+            st.plotly_chart(fig_m, use_container_width=True)
+        with mc2:
+            dm = med.copy()
+            for c in ['ad_revenue','margin','conversions','clicks']:
+                dm[c] = dm[c].apply(lambda x: f"{x:,.0f}")
+            dm['margin_rate'] = dm['margin_rate'].apply(lambda x: f"{x:.1f}%")
+            dm['cvr'] = dm['cvr'].apply(lambda x: f"{x:.1f}%")
+            st.dataframe(dm.rename(columns={
+                'media_name':'매체명','ad_revenue':'광고비(매출)','margin':'마진',
+                'margin_rate':'마진율','conversions':'전환수','clicks':'클릭수','cvr':'CVR'
+            }), use_container_width=True, hide_index=True, height=450)
+
+    with tab_raw:
+        st.caption("필터 + 핵심 지표 기간이 적용된 Raw 데이터")
+        raw = kdf.copy().sort_values('date', ascending=False)
+        rd = raw.copy()
+        rd['date'] = rd['date'].dt.strftime('%Y-%m-%d')
+        rd = rd[['date','publisher_type','ad_name','media_name','advertiser',
+                  'os','ad_type','unit_price','clicks','conversions','cvr',
+                  'ad_revenue','media_cost','margin','margin_rate']]
+        for c in ['unit_price','clicks','conversions','ad_revenue','media_cost','margin']:
+            rd[c] = rd[c].apply(lambda x: f"{x:,.0f}")
+        rd['cvr'] = rd['cvr'].apply(lambda x: f"{x:.2f}%")
+        rd['margin_rate'] = rd['margin_rate'].apply(lambda x: f"{x:.1f}%")
+        st.dataframe(rd.rename(columns={
+            'date':'일자','publisher_type':'퍼블리셔','ad_name':'광고명',
+            'media_name':'매체명','advertiser':'광고주','os':'OS',
+            'ad_type':'광고타입','unit_price':'단가','clicks':'클릭수',
+            'conversions':'전환수','cvr':'CVR','ad_revenue':'광고비',
+            'media_cost':'매체비','margin':'마진','margin_rate':'마진율'
+        }), use_container_width=True, hide_index=True, height=500)
+        csv = raw.to_csv(index=False).encode('utf-8-sig')
+        st.download_button("📥 CSV 다운로드", csv,
+            file_name=f"포인트클릭_{kf}_{kt}.csv", mime="text/csv")
+
+
+# ============================================================
+# 캐시플레이 대시보드
+# ============================================================
+def render_cashplay_dashboard(df: pd.DataFrame):
+    if df.empty:
+        st.warning("캐시플레이 데이터가 없습니다.")
+        return
+
+    dmin, dmax = df['date'].min().date(), df['date'].max().date()
+
+    # ── 핵심 지표 ──
+    st.markdown("## 📈 핵심 지표")
+    ks, ke = get_kpi_default_dates(dmin, dmax)
+    c1, c2, _ = st.columns([1, 1, 4])
+    with c1: kf = st.date_input("시작일", value=ks, min_value=dmin, max_value=dmax, key="cp_kf")
+    with c2: kt = st.date_input("종료일", value=ke, min_value=dmin, max_value=dmax, key="cp_kt")
+
+    kdf = df[(df['date'].dt.date >= kf) & (df['date'].dt.date <= kt)]
+
+    if kdf.empty:
+        st.warning("선택한 기간에 데이터가 없습니다.")
+    else:
+        tr = kdf['revenue_total'].sum()
+        tc = kdf['cost_total'].sum()
+        tm = kdf['margin'].sum()
+        amr = (tm/tr*100) if tr else 0
+        tpc = kdf['pointclick_revenue'].sum()
+        apcr = (tpc/tr*100) if tr else 0
+
+        m1,m2,m3,m4,m5 = st.columns(5)
+        m1.metric("총 매출", format_won(tr), delta=f"{calc_delta_pct(kdf['revenue_total']) or 0:+.1f}% 전일비")
+        m2.metric("매입(리워드)", format_won(tc))
+        m3.metric("마진", format_won(tm), delta=f"{calc_delta_pct(kdf['margin']) or 0:+.1f}% 전일비")
+        m4.metric("마진율", format_pct(amr))
+        m5.metric("🌟 자사 비중", format_pct(apcr))
+
+    st.markdown("---")
+
+    # ── 매출/비용/마진 추이 ──
+    st.markdown("## 💰 매출 · 비용 · 마진 추이 (주단위)")
+    ts, te = get_trend_default_dates(dmin, dmax)
+    t1, t2, _ = st.columns([1, 1, 4])
+    with t1: tf = st.date_input("시작일", value=ts, min_value=dmin, max_value=dmax, key="cp_tf")
+    with t2: tt = st.date_input("종료일", value=te, min_value=dmin, max_value=dmax, key="cp_tt")
+
+    tdf = df[(df['date'].dt.date >= tf) & (df['date'].dt.date <= tt)]
+
+    if not tdf.empty:
+        w = make_weekly(tdf)
+        w['margin_rate'] = (w['margin']/w['revenue_total']*100).round(1).replace([float('inf'),float('-inf')],0).fillna(0)
+        w['wl'] = w['week'].apply(week_label)
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=w['wl'], y=w['revenue_total'], name='총 매출',
+            marker_color=COLORS['indigo'], opacity=0.75,
+            hovertemplate="매출: %{y:,.0f}원<extra></extra>"))
+        fig.add_trace(go.Bar(x=w['wl'], y=-w['cost_total'], name='매입(리워드)',
+            marker_color=COLORS['rose'], opacity=0.75,
+            hovertemplate="매입: %{customdata:,.0f}원<extra></extra>",
+            customdata=w['cost_total']))
+        fig.add_trace(go.Scatter(
+            x=w['wl'], y=w['margin'], name='마진', mode='lines+markers+text',
+            text=[format_won(v) for v in w['margin']], textposition='top center',
+            textfont=dict(size=10, color=COLORS['emerald']),
+            line=dict(color=COLORS['emerald'], width=2.5), marker=dict(size=8, color=COLORS['emerald']),
+            hovertemplate="마진: %{y:,.0f}원<extra></extra>"
+        ))
+        apply_layout(fig, dict(barmode='relative', height=420, xaxis_tickangle=-45, yaxis_title=""))
+        all_vals = list(w['revenue_total']) + list(-w['cost_total']) + list(w['margin'])
+        set_y_korean_ticks(fig, all_vals)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── 매출 구성 ──
+    st.markdown("## 📊 매출 구성 분석")
+    st.caption(f"📅 {kf} ~ {kt}")
+
+    if not kdf.empty:
+        col1, col2 = st.columns(2)
+        with col1:
+            cats = {'게임': kdf['game_total'].sum(), '게더링': kdf['gathering_pointclick'].sum(),
+                    'IAA': kdf['iaa_total'].sum(), '오퍼월': kdf['offerwall_total'].sum()}
+            cdf = pd.DataFrame({'category': cats.keys(), 'amount': cats.values()})
+            fig_p = px.pie(cdf, values='amount', names='category',
+                color_discrete_sequence=[COLORS['game'], COLORS['gathering'], COLORS['iaa'], COLORS['offerwall']],
+                hole=0.5)
+            fig_p.update_traces(textinfo='label+percent', textfont_size=12,
+                hovertemplate="<b>%{label}</b><br>%{value:,.0f}원 (%{percent})<extra></extra>")
+            fig_p.update_layout(height=380, margin=dict(t=30,b=10), showlegend=False,
+                title_text="카테고리별 매출 비중", title_font=dict(size=14, color="#cbd5e1"),
+                paper_bgcolor="rgba(0,0,0,0)", font=dict(family="Inter", color="#94a3b8"))
+            st.plotly_chart(fig_p, use_container_width=True)
+
+        with col2:
+            ks2 = kdf.sort_values('date')
+            fig_s = go.Figure()
+            for nm, col, clr in [('게임','game_total',COLORS['game']),('게더링','gathering_pointclick',COLORS['gathering']),
+                                  ('IAA','iaa_total',COLORS['iaa']),('오퍼월','offerwall_total',COLORS['offerwall'])]:
+                fig_s.add_trace(go.Bar(x=ks2['date'], y=ks2[col], name=nm, marker_color=clr,
+                    hovertemplate=f"<b>{nm}</b><br>%{{x|%m/%d}}: %{{y:,.0f}}원<extra></extra>"))
+            apply_layout(fig_s, dict(barmode='stack', height=380, yaxis_title="",
+                title_text="일별 매출 구성", title_font=dict(size=14, color="#cbd5e1")))
+            set_y_korean_ticks(fig_s, ks2['revenue_total'].tolist())
+            st.plotly_chart(fig_s, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── 자사 기여도 ──
+    st.markdown("## 🌟 자사 서비스(포인트클릭) 기여도")
+
+    if not kdf.empty:
+        pcr = kdf['pointclick_revenue'].sum()
+        ext = kdf['revenue_total'].sum() - pcr
+        c3, c4 = st.columns(2)
+
+        with c3:
+            fig_b = go.Figure()
+            fig_b.add_trace(go.Bar(x=['자사(포인트클릭)'], y=[pcr],
+                marker_color=COLORS['pc_highlight'], text=[format_won(pcr)], textposition='auto', width=0.35,
+                hovertemplate="자사: %{y:,.0f}원<extra></extra>"))
+            fig_b.add_trace(go.Bar(x=['외부 매체'], y=[ext],
+                marker_color=COLORS['slate'], text=[format_won(ext)], textposition='auto', width=0.35,
+                hovertemplate="외부: %{y:,.0f}원<extra></extra>"))
+            apply_layout(fig_b, dict(height=350, showlegend=False, yaxis_title=""))
+            set_y_korean_ticks(fig_b, [pcr, ext])
+            st.plotly_chart(fig_b, use_container_width=True)
+
+        with c4:
+            ks3 = kdf.sort_values('date')
+            fig_dd = go.Figure()
+            fig_dd.add_trace(go.Bar(x=ks3['date'], y=ks3['gathering_pointclick'], name='게더링(포인트클릭)',
+                marker_color='#f43f5e', hovertemplate="게더링: %{y:,.0f}원<extra></extra>"))
+            fig_dd.add_trace(go.Bar(x=ks3['date'], y=ks3['offerwall_pointclick'], name='오퍼월(포인트클릭)',
+                marker_color='#fb7185', hovertemplate="오퍼월: %{y:,.0f}원<extra></extra>"))
+            apply_layout(fig_dd, dict(barmode='stack', height=350, yaxis_title=""))
+            st.plotly_chart(fig_dd, use_container_width=True)
+
+        total_all = kdf['revenue_total'].sum()
+        pc_r = (pcr/total_all*100) if total_all else 0
+        st.info(
+            f"**자사 매출 요약** — 게더링: **{format_won(kdf['gathering_pointclick'].sum())}** · "
+            f"오퍼월: **{format_won(kdf['offerwall_pointclick'].sum())}** · "
+            f"합계: **{format_won(pcr)}** (전체의 **{format_pct(pc_r)}**)")
+
+    st.markdown("---")
+
+    # ── 매출 상세 ──
+    st.markdown("## 🔎 매출 상세")
+
+    if not kdf.empty:
+        dt1, dt2, dt3, dt4, dt5, dt6 = st.tabs([
+            "🎮 게임", "🔗 게더링", "📺 IAA", "📱 오퍼월", "💸 리워드(매입)", "📋 전체"
+        ])
+
+        def fmt_tbl(src, cm):
+            d = src.copy().sort_values('date', ascending=False)
+            d['date'] = d['date'].dt.strftime('%Y-%m-%d')
+            for c in [k for k in cm if k != 'date' and c in d.columns]:
+                d[c] = d[c].apply(lambda x: f"{x:,.0f}")
+            return d.rename(columns=cm)
+
+        with dt1:
+            cols_g = ['date','game_direct','game_dsp','game_rs','game_acquisition','game_total']
+            cm_g = {'date':'날짜','game_direct':'직거래','game_dsp':'DSP','game_rs':'RS','game_acquisition':'인수','game_total':'합계'}
+            dg = kdf[cols_g].copy().sort_values('date', ascending=False)
+            dg['date'] = dg['date'].dt.strftime('%Y-%m-%d')
+            for c in cols_g[1:]:
+                dg[c] = dg[c].apply(lambda x: f"{x:,.0f}")
+            st.dataframe(dg.rename(columns=cm_g), use_container_width=True, hide_index=True)
+
+            gs = kdf.sort_values('date')
+            fig_g = go.Figure()
+            for nm, col in [('직거래','game_direct'),('DSP','game_dsp'),('RS','game_rs'),('인수','game_acquisition')]:
+                fig_g.add_trace(go.Bar(x=gs['date'], y=gs[col], name=nm,
+                    hovertemplate=f"{nm}: %{{y:,.0f}}원<extra></extra>"))
+            apply_layout(fig_g, dict(barmode='stack', height=350, yaxis_title=""))
+            st.plotly_chart(fig_g, use_container_width=True)
+
+        with dt2:
+            dgt = kdf[['date','gathering_pointclick']].copy().sort_values('date', ascending=False)
+            dgt['date'] = dgt['date'].dt.strftime('%Y-%m-%d')
+            dgt['gathering_pointclick'] = dgt['gathering_pointclick'].apply(lambda x: f"{x:,.0f}")
+            st.dataframe(dgt.rename(columns={'date':'날짜','gathering_pointclick':'포인트클릭'}),
+                use_container_width=True, hide_index=True)
+
+        with dt3:
+            cols_i = ['date','iaa_levelplay','iaa_adwhale','iaa_hubble','iaa_total']
+            di = kdf[cols_i].copy().sort_values('date', ascending=False)
+            di['date'] = di['date'].dt.strftime('%Y-%m-%d')
+            for c in cols_i[1:]:
+                di[c] = di[c].apply(lambda x: f"{x:,.0f}")
+            st.dataframe(di.rename(columns={'date':'날짜','iaa_levelplay':'레벨플레이','iaa_adwhale':'애드웨일','iaa_hubble':'허블','iaa_total':'합계'}),
+                use_container_width=True, hide_index=True)
+
+            ias = kdf.sort_values('date')
+            fig_i = go.Figure()
+            for nm, col in [('레벨플레이','iaa_levelplay'),('애드웨일','iaa_adwhale'),('허블','iaa_hubble')]:
+                fig_i.add_trace(go.Bar(x=ias['date'], y=ias[col], name=nm,
+                    hovertemplate=f"{nm}: %{{y:,.0f}}원<extra></extra>"))
+            apply_layout(fig_i, dict(barmode='stack', height=350, yaxis_title=""))
+            st.plotly_chart(fig_i, use_container_width=True)
+
+        with dt4:
+            cols_o = ['date','offerwall_adpopcorn','offerwall_pointclick','offerwall_ive',
+                      'offerwall_adforus','offerwall_addison','offerwall_adjo','offerwall_total']
+            do = kdf[cols_o].copy().sort_values('date', ascending=False)
+            do['date'] = do['date'].dt.strftime('%Y-%m-%d')
+            for c in cols_o[1:]:
+                do[c] = do[c].apply(lambda x: f"{x:,.0f}")
+            st.dataframe(do.rename(columns={
+                'date':'날짜','offerwall_adpopcorn':'애드팝콘','offerwall_pointclick':'⭐포인트클릭',
+                'offerwall_ive':'아이브','offerwall_adforus':'애드포러스',
+                'offerwall_addison':'애디슨','offerwall_adjo':'애드조','offerwall_total':'합계'
+            }), use_container_width=True, hide_index=True)
+
+            ows = kdf.sort_values('date')
+            fig_o = go.Figure()
+            traces = [('⭐포인트클릭','offerwall_pointclick',COLORS['pc_highlight']),
+                      ('애드팝콘','offerwall_adpopcorn',None),('아이브','offerwall_ive',None),
+                      ('애드포러스','offerwall_adforus',None),('애디슨','offerwall_addison',None),('애드조','offerwall_adjo',None)]
+            for nm, col, clr in traces:
+                kw = dict(marker_color=clr) if clr else {}
+                fig_o.add_trace(go.Bar(x=ows['date'], y=ows[col], name=nm,
+                    hovertemplate=f"{nm}: %{{y:,.0f}}원<extra></extra>", **kw))
+            apply_layout(fig_o, dict(barmode='stack', height=350, yaxis_title=""))
+            st.plotly_chart(fig_o, use_container_width=True)
+
+        with dt5:
+            rw1, rw2 = st.columns(2)
+            with rw1:
+                rws = kdf.sort_values('date')
+                fig_rw = go.Figure()
+                fig_rw.add_trace(go.Bar(x=rws['date'], y=rws['reward_paid'], name='유상',
+                    marker_color=COLORS['rose'], hovertemplate="유상: %{y:,.0f}원<extra></extra>"))
+                fig_rw.add_trace(go.Bar(x=rws['date'], y=rws['reward_free'], name='무상',
+                    marker_color=COLORS['orange'], hovertemplate="무상: %{y:,.0f}원<extra></extra>"))
+                apply_layout(fig_rw, dict(barmode='stack', height=350, yaxis_title=""))
+                st.plotly_chart(fig_rw, use_container_width=True)
+            with rw2:
+                fig_rp = px.pie(values=[kdf['reward_paid'].sum(), kdf['reward_free'].sum()],
+                    names=['유상','무상'], color_discrete_sequence=[COLORS['rose'], COLORS['orange']], hole=0.5)
+                fig_rp.update_traces(textinfo='label+percent+value',
+                    hovertemplate="<b>%{label}</b><br>%{value:,.0f}원 (%{percent})<extra></extra>")
+                fig_rp.update_layout(height=350, margin=dict(t=30,b=10),
+                    title_text="유상/무상 비율", title_font=dict(size=14, color="#cbd5e1"),
+                    paper_bgcolor="rgba(0,0,0,0)", font=dict(family="Inter", color="#94a3b8"))
+                st.plotly_chart(fig_rp, use_container_width=True)
+
+        with dt6:
+            full = kdf.copy().sort_values('date', ascending=False)
+            fd = full.copy()
+            fd['date'] = fd['date'].dt.strftime('%Y-%m-%d')
+            for c in [col for col in fd.columns if col != 'date']:
+                if pd.api.types.is_numeric_dtype(full[c]):
+                    if 'rate' in c or 'ratio' in c:
+                        fd[c] = fd[c].apply(lambda x: f"{x:.1f}%")
+                    else:
+                        fd[c] = fd[c].apply(lambda x: f"{x:,.0f}")
+            st.dataframe(fd, use_container_width=True, hide_index=True, height=500)
+            csv = full.to_csv(index=False).encode('utf-8-sig')
+            st.download_button("📥 CSV 다운로드", csv,
+                file_name=f"캐시플레이_{kf}_{kt}.csv", mime="text/csv")
+
+
+# ============================================================
+# 메인
+# ============================================================
+def main():
+    st.title("📊 리워드 플랫폼 대시보드")
+    st.caption(f"마지막 새로고침: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+    with st.sidebar:
+        # 사용자 정보 표시
+        user_name = st.user.get("name", "")
+        user_email = st.user.get("email", "")
+        if user_name:
+            st.markdown(f"👤 **{user_name}**")
+            st.caption(user_email)
+        if st.button("🚪 로그아웃", use_container_width=True):
+            st.logout()
+        st.markdown("---")
+        st.markdown("## ⚙️ 설정")
+        if st.button("🔄 데이터 새로고침", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+        st.markdown("---")
+
+    with st.spinner("데이터 로딩 중..."):
+        pc_raw = load_sheet_data(SHEET_NAMES["포인트클릭"]["db"])
+        cp_raw = load_sheet_data(SHEET_NAMES["캐시플레이"]["db"])
+        pc_df = load_pointclick(pc_raw)
+        cp_df = load_cashplay(cp_raw)
+
+    tab_pc, tab_cp = st.tabs(["🟢 포인트클릭", "🔵 캐시플레이"])
+    with tab_pc:
+        render_pointclick_dashboard(pc_df)
+    with tab_cp:
+        render_cashplay_dashboard(cp_df)
+
+
+if __name__ == "__main__":
+    main()
